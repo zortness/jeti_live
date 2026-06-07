@@ -1,0 +1,22 @@
+# Compiled binaries
+jeti_inspector.exe
+jeti_inspector_linux
+jeti_inspector_mac
+jeti_live.exe
+
+# Capture files (can be large)
+*.pcap
+*.pcapng
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Go build cache
+*.test
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

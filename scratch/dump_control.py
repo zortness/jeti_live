@@ -1,0 +1,57 @@
+import struct
+import os
+
+def parse_pcapng(filepath):
+    packets = []
+    with open(filepath, 'rb') as f:
+        shb_header = f.read(8)
+        if len(shb_header) < 8:
+            return packets
+        block_type, block_len = struct.unpack('<II', shb_header)
+        if block_type != 0x0A0D0D0A:
+            return packets
+        f.seek(0)
+        while True:
+            header = f.read(8)
+            if len(header) < 8:
+                break
+            block_type, block_len = struct.unpack('<II', header)
+            if block_len < 12:
+                break
+            body_len = block_len - 12
+            body = f.read(body_len)
+            f.read(4) # footer
+            
+            if block_type == 0x00000006:
+                interface_id, ts_high, ts_low, cap_len, orig_len = struct.unpack('<IIIII', body[:20])
+                packet_data = body[20:20+cap_len]
+                packets.append(packet_data)
+    return packets
+
+def main():
+    pcap_files = ['usbcapture1.pcapng']
+    for pcap_file in pcap_files:
+        if not os.path.exists(pcap_file):
+            continue
+        print(f"\n=================== USB Control Transfers in {pcap_file} ===================")
+        packets = parse_pcapng(pcap_file)
+        
+        count = 0
+        for pkt in packets:
+            if len(pkt) < 27:
+                continue
+            header_len = struct.unpack('<H', pkt[:2])[0]
+            transfer_type = pkt[22]
+            
+            if transfer_type == 2: # URB_CONTROL
+                # Print the entire USBPcap packet header and whatever follows
+                print(f"Pkt length: {len(pkt)}, Header len: {header_len}")
+                print(f"  USBPcap header: {pkt[:header_len].hex(' ').upper()}")
+                if len(pkt) > header_len:
+                    print(f"  Rest: {pkt[header_len:].hex(' ').upper()}")
+                count += 1
+                if count >= 30:
+                    break
+
+if __name__ == "__main__":
+    main()

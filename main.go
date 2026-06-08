@@ -306,8 +306,8 @@ func main() {
 
 						// Decode screen lines (only from the suffix after the EX packet)
 						if len(pkt.Payload) >= 2 {
-							exLength := int(pkt.Payload[1] & 0x3F)
-							textStart := 2 + exLength + 1
+							lenEx := int(pkt.Payload[1])
+							textStart := 3 + lenEx
 							if textStart < len(pkt.Payload) {
 								var printable []string
 								var current []byte
@@ -495,26 +495,37 @@ func getDataTypeSize(dataType byte) int {
 }
 
 func parseTelemetry(state *DashboardState, payload []byte) {
-	if len(payload) < 2 {
+	if len(payload) < 4 {
 		return
 	}
-	exLength := int(payload[1] & 0x3F)
-	if len(payload) < 2+exLength {
+	lenEx := int(payload[1])
+	if len(payload) < 3+lenEx {
 		return
 	}
 
-	// Product ID is 2 bytes (bytes 2-3), Device ID is 4 bytes (bytes 4-7)
-	if len(payload) < 8 {
+	// The EX packet starts at payload[3]
+	if payload[3]&0x0F != 0x0F {
 		return
 	}
-	devID := binary.LittleEndian.Uint32(payload[4:8])
-	physicalPrefix := devID >> 8
 
-	// Differentiate Text packets (exLength >= 16) and Data packets (exLength <= 15)
-	if exLength <= 15 {
-		idx := 8
-		endIdx := 2 + exLength
+	// Product ID is 2 bytes (bytes 2-3 of EX packet), Device ID is 4 bytes (bytes 4-7 of EX packet)
+	// These correspond to payload[5:9] (which is little-endian uint32 devID)
+	if len(payload) < 9 {
+		return
+	}
+	devID := binary.LittleEndian.Uint32(payload[5:9])
+	physicalPrefix := devID & 0x00FFFFFF
+
+	exType := (payload[4] >> 6) & 0x03
+	exLength := int(payload[4] & 0x3F)
+
+	if exType == 1 {
+		idx := 10
+		endIdx := 4 + exLength
 		for idx < endIdx {
+			if idx >= len(payload) {
+				break
+			}
 			firstByte := payload[idx]
 			idx++
 
@@ -522,11 +533,7 @@ func parseTelemetry(state *DashboardState, payload []byte) {
 			dataType := firstByte & 0x0F
 
 			size := getDataTypeSize(dataType)
-			if fieldID == 5 && dataType == 4 {
-				size = 2 // override quirk: Field 5 DataType 4 is 2 bytes in Jeti receiver
-			}
-
-			if idx+size > endIdx {
+			if idx+size > endIdx || idx+size > len(payload) {
 				break
 			}
 
@@ -556,24 +563,19 @@ func parseTelemetry(state *DashboardState, payload []byte) {
 			}
 
 			var valStr string
-			if fieldID == 5 && dataType == 4 {
-				// Rx Voltage (Field 5 DataType 4 is scaled in millivolts)
-				valStr = fmt.Sprintf("%.2f", floatVal/1000.0)
+			if precision > 0 {
+				valStr = fmt.Sprintf("%.*f", precision, floatVal)
 			} else {
-				if precision > 0 {
-					valStr = fmt.Sprintf("%.*f", precision, floatVal)
-				} else {
-					valStr = fmt.Sprintf("%.0f", floatVal)
-				}
+				valStr = fmt.Sprintf("%.0f", floatVal)
 			}
 
 			state.UpdateValue(physicalPrefix, fieldID, valStr)
 		}
-	} else {
+	} else if exType == 0 {
 		// Text packet: text label definitions start at index 10
 		idx := 10
-		endIdx := 2 + exLength
-		if idx+2 <= endIdx {
+		endIdx := 4 + exLength
+		if idx+2 <= endIdx && idx+2 <= len(payload) {
 			fieldID := payload[idx]
 			idx++
 			lengths := payload[idx]
@@ -581,7 +583,7 @@ func parseTelemetry(state *DashboardState, payload []byte) {
 			descLen := int(lengths >> 3)
 			unitLen := int(lengths & 0x07)
 
-			if idx+descLen+unitLen <= endIdx {
+			if idx+descLen+unitLen <= endIdx && idx+descLen+unitLen <= len(payload) {
 				descBytes := payload[idx : idx+descLen]
 				idx += descLen
 				unitBytes := payload[idx : idx+unitLen]

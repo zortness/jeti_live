@@ -20,3 +20,7 @@ __pycache__/
 Thumbs.db
 *.swp
 *.swo
+
+*.pdf
+
+scratch/

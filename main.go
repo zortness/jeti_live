@@ -73,6 +73,85 @@ func (s *DashboardState) UpdateDisplay(lines [2]string) {
 	}
 }
 
+func applyFallbacks(dev *DeviceState, physicalPrefix uint32) {
+	name := dev.DeviceName
+	if name == "" {
+		switch physicalPrefix {
+		case 0x4BA6E2, 0x6FA6E2:
+			name = "Receiver"
+		case 0x0DA881:
+			name = "MT-125"
+		}
+	}
+
+	nameLower := strings.ToLower(name)
+	if strings.Contains(nameLower, "mui") {
+		if f1, ok := dev.Fields[1]; ok {
+			if f1.FieldName == "" || strings.HasPrefix(f1.FieldName, "Field ") {
+				f1.FieldName = "Voltage"
+				f1.Unit = "V"
+				dev.Fields[1] = f1
+			}
+		}
+		if f2, ok := dev.Fields[2]; ok {
+			if f2.FieldName == "" || strings.HasPrefix(f2.FieldName, "Field ") {
+				f2.FieldName = "Current"
+				f2.Unit = "A"
+				dev.Fields[2] = f2
+			}
+		}
+		if f3, ok := dev.Fields[3]; ok {
+			if f3.FieldName == "" || strings.HasPrefix(f3.FieldName, "Field ") {
+				f3.FieldName = "Capacity"
+				f3.Unit = "mAh"
+				dev.Fields[3] = f3
+			}
+		}
+		if f4, ok := dev.Fields[4]; ok {
+			if f4.FieldName == "" || strings.HasPrefix(f4.FieldName, "Field ") {
+				f4.FieldName = "Run time"
+				f4.Unit = "s"
+				dev.Fields[4] = f4
+			}
+		}
+	} else if strings.Contains(nameLower, "receiver") || physicalPrefix == 0x4BA6E2 || physicalPrefix == 0x6FA6E2 {
+		if f1, ok := dev.Fields[1]; ok {
+			if f1.FieldName == "" || strings.HasPrefix(f1.FieldName, "Field ") {
+				f1.FieldName = "Voltage RX"
+				f1.Unit = "V"
+				dev.Fields[1] = f1
+			}
+		}
+		if f2, ok := dev.Fields[2]; ok {
+			if f2.FieldName == "" || strings.HasPrefix(f2.FieldName, "Field ") {
+				f2.FieldName = "Antenna 1"
+				dev.Fields[2] = f2
+			}
+		}
+		if f3, ok := dev.Fields[3]; ok {
+			if f3.FieldName == "" || strings.HasPrefix(f3.FieldName, "Field ") {
+				f3.FieldName = "Antenna 2"
+				dev.Fields[3] = f3
+			}
+		}
+	} else if strings.Contains(nameLower, "mt-125") || physicalPrefix == 0x0DA881 {
+		if f1, ok := dev.Fields[1]; ok {
+			if f1.FieldName == "" || strings.HasPrefix(f1.FieldName, "Field ") {
+				f1.FieldName = "Temp A"
+				f1.Unit = "°C"
+				dev.Fields[1] = f1
+			}
+		}
+		if f2, ok := dev.Fields[2]; ok {
+			if f2.FieldName == "" || strings.HasPrefix(f2.FieldName, "Field ") {
+				f2.FieldName = "Temp B"
+				f2.Unit = "°C"
+				dev.Fields[2] = f2
+			}
+		}
+	}
+}
+
 func (s *DashboardState) UpdateValue(physicalPrefix uint32, fieldID byte, val string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -95,6 +174,8 @@ func (s *DashboardState) UpdateValue(physicalPrefix uint32, fieldID byte, val st
 		field.FieldName = fmt.Sprintf("Field %d", fieldID)
 	}
 	dev.Fields[fieldID] = field
+
+	applyFallbacks(dev, physicalPrefix)
 }
 
 func (s *DashboardState) UpdateFieldMeta(physicalPrefix uint32, fieldID byte, name string, unit string) {
@@ -109,6 +190,7 @@ func (s *DashboardState) UpdateFieldMeta(physicalPrefix uint32, fieldID byte, na
 	}
 	if fieldID == 0 {
 		dev.DeviceName = name
+		applyFallbacks(dev, physicalPrefix)
 		return
 	}
 	field, exists := dev.Fields[fieldID]
@@ -120,6 +202,8 @@ func (s *DashboardState) UpdateFieldMeta(physicalPrefix uint32, fieldID byte, na
 	field.FieldName = name
 	field.Unit = unit
 	dev.Fields[fieldID] = field
+
+	applyFallbacks(dev, physicalPrefix)
 }
 
 func drawDashboard(state *DashboardState) {
@@ -171,7 +255,7 @@ func drawDashboard(state *DashboardState) {
 			if devName == "" {
 				// Default mappings if we don't have the text registration name yet
 				switch prefix {
-				case 0x4BA6E2:
+				case 0x4BA6E2, 0x6FA6E2:
 					devName = "Receiver"
 				case 0x0DA881:
 					devName = "MT-125"

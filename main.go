@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"log"
@@ -31,6 +33,12 @@ type DeviceState struct {
 	Fields     map[byte]TelemetryField
 }
 
+type CSVColumn struct {
+	PhysicalPrefix uint32
+	FieldID        byte
+	HeaderName     string
+}
+
 type DashboardState struct {
 	mu           sync.Mutex
 	Connected    bool
@@ -39,6 +47,21 @@ type DashboardState struct {
 	DeviceID     string
 	DisplayLines [2]string
 	Devices      map[uint32]*DeviceState // key: physicalPrefix (DeviceID >> 8)
+
+	// CSV Logging State
+	LogEnabled       bool
+	LogInterval      time.Duration
+	LogDelay         time.Duration
+	LogFileSetting   string
+	LogActive        bool
+	LogDelayActive   bool
+	LogDelayEndTime  time.Time
+	LogFileName      string
+	LogColumns       []CSVColumn
+	logFile          *os.File
+	logWriter        *csv.Writer
+	logTicker        *time.Ticker
+	logDone          chan bool
 }
 
 func newDashboardState(port string, baud int) *DashboardState {
@@ -152,6 +175,32 @@ func applyFallbacks(dev *DeviceState, physicalPrefix uint32) {
 	}
 }
 
+func getCSVHeaderName(prefix uint32, devName string, field TelemetryField) string {
+	devClean := devName
+	if devClean == "" {
+		switch prefix {
+		case 0x4BA6E2, 0x6FA6E2:
+			devClean = "Receiver"
+		case 0x0DA881:
+			devClean = "MT-125"
+		default:
+			devClean = fmt.Sprintf("Device_%06X", prefix)
+		}
+	}
+	devClean = strings.ReplaceAll(devClean, " ", "_")
+	fieldClean := strings.ReplaceAll(field.FieldName, " ", "_")
+	return fmt.Sprintf("%s_%06X_F%d_%s", devClean, prefix, field.FieldID, fieldClean)
+}
+
+func (s *DashboardState) updateCSVColumnHeader(prefix uint32, fieldID byte, devName string, field TelemetryField) {
+	for i, col := range s.LogColumns {
+		if col.PhysicalPrefix == prefix && col.FieldID == fieldID {
+			s.LogColumns[i].HeaderName = getCSVHeaderName(prefix, devName, field)
+			break
+		}
+	}
+}
+
 func (s *DashboardState) UpdateValue(physicalPrefix uint32, fieldID byte, val string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -176,6 +225,27 @@ func (s *DashboardState) UpdateValue(physicalPrefix uint32, fieldID byte, val st
 	dev.Fields[fieldID] = field
 
 	applyFallbacks(dev, physicalPrefix)
+
+	// Dynamically append new CSV column if logging is active
+	if s.LogActive {
+		found := false
+		for _, col := range s.LogColumns {
+			if col.PhysicalPrefix == physicalPrefix && col.FieldID == fieldID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if updatedField, ok := dev.Fields[fieldID]; ok {
+				col := CSVColumn{
+					PhysicalPrefix: physicalPrefix,
+					FieldID:        fieldID,
+					HeaderName:     getCSVHeaderName(physicalPrefix, dev.DeviceName, updatedField),
+				}
+				s.LogColumns = append(s.LogColumns, col)
+			}
+		}
+	}
 }
 
 func (s *DashboardState) UpdateFieldMeta(physicalPrefix uint32, fieldID byte, name string, unit string) {
@@ -191,6 +261,15 @@ func (s *DashboardState) UpdateFieldMeta(physicalPrefix uint32, fieldID byte, na
 	if fieldID == 0 {
 		dev.DeviceName = name
 		applyFallbacks(dev, physicalPrefix)
+
+		// Update headers for all columns of this device prefix
+		for i, col := range s.LogColumns {
+			if col.PhysicalPrefix == physicalPrefix {
+				if f, ok := dev.Fields[col.FieldID]; ok {
+					s.LogColumns[i].HeaderName = getCSVHeaderName(physicalPrefix, name, f)
+				}
+			}
+		}
 		return
 	}
 	field, exists := dev.Fields[fieldID]
@@ -204,6 +283,221 @@ func (s *DashboardState) UpdateFieldMeta(physicalPrefix uint32, fieldID byte, na
 	dev.Fields[fieldID] = field
 
 	applyFallbacks(dev, physicalPrefix)
+
+	// Dynamically update column header
+	if f, ok := dev.Fields[fieldID]; ok {
+		s.updateCSVColumnHeader(physicalPrefix, fieldID, dev.DeviceName, f)
+	}
+
+	// Dynamically append new CSV column if logging is active
+	if s.LogActive {
+		found := false
+		for _, col := range s.LogColumns {
+			if col.PhysicalPrefix == physicalPrefix && col.FieldID == fieldID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if f, ok := dev.Fields[fieldID]; ok {
+				col := CSVColumn{
+					PhysicalPrefix: physicalPrefix,
+					FieldID:        fieldID,
+					HeaderName:     getCSVHeaderName(physicalPrefix, dev.DeviceName, f),
+				}
+				s.LogColumns = append(s.LogColumns, col)
+			}
+		}
+	}
+}
+
+func (s *DashboardState) startLogging() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.LogActive {
+		return
+	}
+
+	// 1. Determine filename
+	now := time.Now()
+	var filename string
+	if s.LogFileSetting == "" || s.LogFileSetting == "auto" {
+		filename = fmt.Sprintf("log_%s.csv", now.Format("20060102_150405"))
+	} else {
+		filename = s.LogFileSetting
+	}
+
+	// 2. Open temporary raw file
+	tempFilename := filename + ".tmp.csv"
+	file, err := os.Create(tempFilename)
+	if err != nil {
+		fmt.Printf("\nError creating log file: %v\n", err)
+		return
+	}
+
+	s.LogFileName = filename
+	s.logFile = file
+	s.logWriter = csv.NewWriter(file)
+	s.LogActive = true
+	s.LogDelayActive = false
+
+	// 3. Populate initial columns based on discovered devices/fields
+	s.LogColumns = nil
+	var prefixes []uint32
+	for prefix := range s.Devices {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Slice(prefixes, func(i, j int) bool { return prefixes[i] < prefixes[j] })
+
+	for _, prefix := range prefixes {
+		dev := s.Devices[prefix]
+		var fieldIDs []byte
+		for fid := range dev.Fields {
+			fieldIDs = append(fieldIDs, fid)
+		}
+		sort.Slice(fieldIDs, func(i, j int) bool { return fieldIDs[i] < fieldIDs[j] })
+
+		for _, fid := range fieldIDs {
+			field := dev.Fields[fid]
+			col := CSVColumn{
+				PhysicalPrefix: prefix,
+				FieldID:        fid,
+				HeaderName:     getCSVHeaderName(prefix, dev.DeviceName, field),
+			}
+			s.LogColumns = append(s.LogColumns, col)
+		}
+	}
+
+	// 4. Start Ticker
+	s.logDone = make(chan bool)
+	s.logTicker = time.NewTicker(s.LogInterval)
+
+	go func(ticker *time.Ticker, done chan bool) {
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				s.writeLogLine()
+			}
+		}
+	}(s.logTicker, s.logDone)
+}
+
+func (s *DashboardState) stopLogging() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.LogDelayActive {
+		s.LogDelayActive = false
+		s.LogActive = false
+		return
+	}
+
+	if !s.LogActive {
+		return
+	}
+
+	// 1. Stop Ticker
+	if s.logTicker != nil {
+		s.logTicker.Stop()
+	}
+	if s.logDone != nil {
+		close(s.logDone)
+	}
+
+	// 2. Close temporary file
+	if s.logWriter != nil {
+		s.logWriter.Flush()
+	}
+	if s.logFile != nil {
+		s.logFile.Close()
+	}
+
+	s.LogActive = false
+
+	// 3. Finalize CSV: read temp file, prepend header, pad rows, and write to final file
+	tempFilename := s.LogFileName + ".tmp.csv"
+	finalFilename := s.LogFileName
+
+	tempFile, err := os.Open(tempFilename)
+	if err != nil {
+		fmt.Printf("\nError opening temp log file for finalization: %v\n", err)
+		return
+	}
+	defer tempFile.Close()
+
+	finalFile, err := os.Create(finalFilename)
+	if err != nil {
+		fmt.Printf("\nError creating final log file: %v\n", err)
+		return
+	}
+	defer finalFile.Close()
+
+	reader := csv.NewReader(tempFile)
+	reader.FieldsPerRecord = -1
+
+	writer := csv.NewWriter(finalFile)
+
+	// 3a. Write Header Row
+	header := make([]string, 1, 1+len(s.LogColumns))
+	header[0] = "Timestamp"
+	for _, col := range s.LogColumns {
+		header = append(header, col.HeaderName)
+	}
+	writer.Write(header)
+
+	// 3b. Read, Pad, and Write all rows
+	targetLen := 1 + len(s.LogColumns)
+	for {
+		record, err := reader.Read()
+		if err != nil {
+			break
+		}
+
+		for len(record) < targetLen {
+			record = append(record, "")
+		}
+		if len(record) > targetLen {
+			record = record[:targetLen]
+		}
+
+		writer.Write(record)
+	}
+
+	writer.Flush()
+	tempFile.Close()
+	finalFile.Close()
+
+	os.Remove(tempFilename)
+}
+
+func (s *DashboardState) writeLogLine() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.LogActive || s.logWriter == nil {
+		return
+	}
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+
+	row := make([]string, 1, 1+len(s.LogColumns))
+	row[0] = timestamp
+
+	for _, col := range s.LogColumns {
+		val := ""
+		if dev, ok := s.Devices[col.PhysicalPrefix]; ok {
+			if f, ok := dev.Fields[col.FieldID]; ok {
+				val = f.Value
+			}
+		}
+		row = append(row, val)
+	}
+
+	s.logWriter.Write(row)
+	s.logWriter.Flush()
 }
 
 func drawDashboard(state *DashboardState) {
@@ -224,6 +518,19 @@ func drawDashboard(state *DashboardState) {
 	}
 	fmt.Printf("Status: %s\033[K\n", status)
 	fmt.Printf("Device: \033[1;35m%s\033[0m\033[K\n", state.DeviceID)
+
+	// Print CSV Logging Status
+	logStatus := "\033[1;30mINACTIVE\033[0m"
+	if state.LogActive {
+		logStatus = fmt.Sprintf("\033[1;32mACTIVE\033[0m (file: %s, interval: %v)", state.LogFileName, state.LogInterval)
+	} else if state.LogDelayActive {
+		timeLeft := time.Until(state.LogDelayEndTime).Seconds()
+		if timeLeft < 0 {
+			timeLeft = 0
+		}
+		logStatus = fmt.Sprintf("\033[1;33mWAITING\033[0m (starting in %.1fs, discovering sensors...)", timeLeft)
+	}
+	fmt.Printf("Logging: %s\033[K\n", logStatus)
 	fmt.Println("\033[K")
 
 	// Print JetiBox Display Screen
@@ -289,15 +596,23 @@ func drawDashboard(state *DashboardState) {
 			fmt.Println("--------------------------------------------------------------\033[K")
 		}
 	}
-	fmt.Println("\nPress Ctrl+C to exit.\033[K")
+	fmt.Println("\nPress Ctrl+C to exit. Type 'stop' (t) / 'start' (s) to control CSV logging.\033[K")
 }
 
 func main() {
 	portFlag := flag.String("port", "COM17", "Serial port to connect to")
 	baudFlag := flag.Int("baud", 250000, "Baud rate")
+	logFlag := flag.Bool("log", false, "Enable CSV data logging")
+	logIntervalFlag := flag.Duration("log-interval", 1*time.Second, "Interval between log rows")
+	logDelayFlag := flag.Duration("log-delay", 30*time.Second, "Startup delay before logging begins")
+	logFileFlag := flag.String("log-file", "", "Output CSV filename")
 	flag.Parse()
 
 	state := newDashboardState(*portFlag, *baudFlag)
+	state.LogEnabled = *logFlag
+	state.LogInterval = *logIntervalFlag
+	state.LogDelay = *logDelayFlag
+	state.LogFileSetting = *logFileFlag
 
 	// Set up serial mode
 	mode := &serial.Mode{
@@ -306,6 +621,48 @@ func main() {
 		DataBits: 8,
 		StopBits: serial.OneStopBit,
 	}
+
+	if state.LogEnabled {
+		state.LogDelayActive = true
+		state.LogDelayEndTime = time.Now().Add(state.LogDelay)
+		go func() {
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					state.mu.Lock()
+					if state.LogDelayActive && time.Now().After(state.LogDelayEndTime) {
+						state.mu.Unlock()
+						state.startLogging()
+						return
+					}
+					if !state.LogDelayActive {
+						state.mu.Unlock()
+						return
+					}
+					state.mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	// Stdin Command reader goroutine
+	go func() {
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			text, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			text = strings.TrimSpace(strings.ToLower(text))
+			if text == "start" || text == "s" {
+				state.startLogging()
+			} else if text == "stop" || text == "t" {
+				state.stopLogging()
+			}
+		}
+	}()
 
 	fmt.Printf("Opening port %s...\n", *portFlag)
 	port, err := serial.Open(*portFlag, mode)
@@ -472,6 +829,7 @@ func main() {
 	// Wait for Ctrl+C
 	<-sigChan
 	done <- true
+	state.stopLogging()
 	fmt.Println("\nExiting Jeti inspector...")
 }
 

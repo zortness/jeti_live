@@ -72,6 +72,8 @@ type DashboardState struct {
 	// Alarms & Interactive Settings Menu
 	Alarms   map[byte]AlarmState
 	ShowMenu bool
+
+	Headless bool
 }
 
 func newDashboardState(port string, baud int) *DashboardState {
@@ -237,8 +239,8 @@ func (s *DashboardState) UpdateValue(physicalPrefix uint32, fieldID byte, val st
 
 	applyFallbacks(dev, physicalPrefix)
 
-	// Dynamically append new CSV column if logging is active
-	if s.LogActive {
+	// Dynamically append new CSV column if logging is active and not headless
+	if s.LogActive && !s.Headless {
 		found := false
 		for _, col := range s.LogColumns {
 			if col.PhysicalPrefix == physicalPrefix && col.FieldID == fieldID {
@@ -300,8 +302,8 @@ func (s *DashboardState) UpdateFieldMeta(physicalPrefix uint32, fieldID byte, na
 		s.updateCSVColumnHeader(physicalPrefix, fieldID, dev.DeviceName, f)
 	}
 
-	// Dynamically append new CSV column if logging is active
-	if s.LogActive {
+	// Dynamically append new CSV column if logging is active and not headless
+	if s.LogActive && !s.Headless {
 		found := false
 		for _, col := range s.LogColumns {
 			if col.PhysicalPrefix == physicalPrefix && col.FieldID == fieldID {
@@ -330,28 +332,36 @@ func (s *DashboardState) startLogging() {
 		return
 	}
 
-	// 1. Determine filename
-	now := time.Now()
-	var filename string
-	if s.LogFileSetting == "" || s.LogFileSetting == "auto" {
-		filename = fmt.Sprintf("log_%s.csv", now.Format("20060102_150405"))
+	if s.Headless {
+		s.LogFileName = "stdout"
+		s.logFile = nil
+		s.logWriter = csv.NewWriter(os.Stdout)
+		s.LogActive = true
+		s.LogDelayActive = false
 	} else {
-		filename = s.LogFileSetting
-	}
+		// 1. Determine filename
+		now := time.Now()
+		var filename string
+		if s.LogFileSetting == "" || s.LogFileSetting == "auto" {
+			filename = fmt.Sprintf("log_%s.csv", now.Format("20060102_150405"))
+		} else {
+			filename = s.LogFileSetting
+		}
 
-	// 2. Open temporary raw file
-	tempFilename := filename + ".tmp.csv"
-	file, err := os.Create(tempFilename)
-	if err != nil {
-		fmt.Printf("\nError creating log file: %v\n", err)
-		return
-	}
+		// 2. Open temporary raw file
+		tempFilename := filename + ".tmp.csv"
+		file, err := os.Create(tempFilename)
+		if err != nil {
+			fmt.Printf("\nError creating log file: %v\n", err)
+			return
+		}
 
-	s.LogFileName = filename
-	s.logFile = file
-	s.logWriter = csv.NewWriter(file)
-	s.LogActive = true
-	s.LogDelayActive = false
+		s.LogFileName = filename
+		s.logFile = file
+		s.logWriter = csv.NewWriter(file)
+		s.LogActive = true
+		s.LogDelayActive = false
+	}
 
 	// 3. Populate initial columns based on discovered devices/fields
 	s.LogColumns = nil
@@ -378,6 +388,18 @@ func (s *DashboardState) startLogging() {
 			}
 			s.LogColumns = append(s.LogColumns, col)
 		}
+	}
+
+	if s.Headless {
+		// Write Header Row immediately to stdout
+		header := make([]string, 1, 2+len(s.LogColumns))
+		header[0] = "Timestamp"
+		header = append(header, "Active_Alarms")
+		for _, col := range s.LogColumns {
+			header = append(header, col.HeaderName)
+		}
+		s.logWriter.Write(header)
+		s.logWriter.Flush()
 	}
 
 	// 4. Start Ticker
@@ -418,7 +440,7 @@ func (s *DashboardState) stopLogging() {
 		close(s.logDone)
 	}
 
-	// 2. Close temporary file
+	// 2. Close temporary file / flush
 	if s.logWriter != nil {
 		s.logWriter.Flush()
 	}
@@ -427,6 +449,10 @@ func (s *DashboardState) stopLogging() {
 	}
 
 	s.LogActive = false
+
+	if s.Headless {
+		return
+	}
 
 	// 3. Finalize CSV: read temp file, prepend header, pad rows, and write to final file
 	tempFilename := s.LogFileName + ".tmp.csv"
@@ -778,13 +804,23 @@ func main() {
 	logIntervalFlag := flag.Duration("log-interval", 1*time.Second, "Interval between log rows")
 	logDelayFlag := flag.Duration("log-delay", 30*time.Second, "Startup delay before logging begins")
 	logFileFlag := flag.String("log-file", "", "Output CSV filename")
+	headlessFlag := flag.Bool("headless", false, "Run in headless mode (pipes repeating CSV log output directly to stdout; disables TUI dashboard)")
 	flag.Parse()
 
 	state := newDashboardState(*portFlag, *baudFlag)
-	state.LogEnabled = *logFlag
+	state.Headless = *headlessFlag
+	if state.Headless {
+		state.LogEnabled = true
+	} else {
+		state.LogEnabled = *logFlag
+	}
 	state.LogInterval = *logIntervalFlag
 	state.LogDelay = *logDelayFlag
 	state.LogFileSetting = *logFileFlag
+
+	if state.Headless {
+		fmt.Fprintf(os.Stderr, "Running in headless mode. Waiting for %v startup delay to discover sensors before streaming CSV to stdout...\n", state.LogDelay)
+	}
 
 	// Set up serial mode
 	mode := &serial.Mode{
@@ -819,7 +855,11 @@ func main() {
 		}()
 	}
 
-	fmt.Printf("Opening port %s...\n", *portFlag)
+	if state.Headless {
+		fmt.Fprintf(os.Stderr, "Opening port %s...\n", *portFlag)
+	} else {
+		fmt.Printf("Opening port %s...\n", *portFlag)
+	}
 	port, err := serial.Open(*portFlag, mode)
 	if err != nil {
 		log.Fatalf("Failed to open port: %v", err)
@@ -828,10 +868,18 @@ func main() {
 
 	// Configure modem control signals (DTR=True, RTS=False)
 	if err := port.SetDTR(true); err != nil {
-		fmt.Printf("Warning: Failed to set DTR: %v\n", err)
+		if state.Headless {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to set DTR: %v\n", err)
+		} else {
+			fmt.Printf("Warning: Failed to set DTR: %v\n", err)
+		}
 	}
 	if err := port.SetRTS(false); err != nil {
-		fmt.Printf("Warning: Failed to set RTS: %v\n", err)
+		if state.Headless {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to set RTS: %v\n", err)
+		} else {
+			fmt.Printf("Warning: Failed to set RTS: %v\n", err)
+		}
 	}
 
 	state.UpdateConnection(true)
@@ -839,10 +887,14 @@ func main() {
 	// Clean input buffer
 	port.ResetInputBuffer()
 
-	// Put terminal in raw mode
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		fmt.Printf("Warning: Failed to make terminal raw: %v\r\n", err)
+	var oldState *term.State
+	if !state.Headless {
+		// Put terminal in raw mode
+		var err error
+		oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			fmt.Printf("Warning: Failed to make terminal raw: %v\r\n", err)
+		}
 	}
 
 	var restoreOnce sync.Once
@@ -857,44 +909,46 @@ func main() {
 	defer cleanup()
 
 	// Stdin Command reader goroutine
-	go func() {
-		buf := make([]byte, 1)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if err != nil || n == 0 {
-				break
-			}
-			char := buf[0]
-			if char == 0x03 { // Ctrl+C
-				cleanup()
-				fmt.Print("\r\nExiting Jeti inspector...\r\n")
-				os.Exit(0)
-			}
-			
-			lower := strings.ToLower(string(char))
-			if len(lower) > 0 {
-				key := lower[0]
-				switch key {
-				case 'm':
-					state.ToggleMenu()
-				case 's':
-					state.mu.Lock()
-					isDelayActive := state.LogDelayActive
-					isActive := state.LogActive
-					state.mu.Unlock()
-					if isActive || isDelayActive {
-						state.stopLogging()
-					} else {
-						state.startLogging()
+	if !state.Headless {
+		go func() {
+			buf := make([]byte, 1)
+			for {
+				n, err := os.Stdin.Read(buf)
+				if err != nil || n == 0 {
+					break
+				}
+				char := buf[0]
+				if char == 0x03 { // Ctrl+C
+					cleanup()
+					fmt.Print("\r\nExiting Jeti inspector...\r\n")
+					os.Exit(0)
+				}
+				
+				lower := strings.ToLower(string(char))
+				if len(lower) > 0 {
+					key := lower[0]
+					switch key {
+					case 'm':
+						state.ToggleMenu()
+					case 's':
+						state.mu.Lock()
+						isDelayActive := state.LogDelayActive
+						isActive := state.LogActive
+						state.mu.Unlock()
+						if isActive || isDelayActive {
+							state.stopLogging()
+						} else {
+							state.startLogging()
+						}
+					case 'i':
+						state.cycleInterval()
+					case 'd':
+						state.cycleDelay()
 					}
-				case 'i':
-					state.cycleInterval()
-				case 'd':
-					state.cycleDelay()
 				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// Channel to signal shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -1027,26 +1081,34 @@ func main() {
 
 	// Dashboard renderer loop (every 150ms)
 	done := make(chan bool)
-	go func() {
-		// Clear screen once on startup
-		fmt.Print("\033[H\033[2J")
-		ticker := time.NewTicker(150 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				drawDashboard(state)
+	if !state.Headless {
+		go func() {
+			// Clear screen once on startup
+			fmt.Print("\033[H\033[2J")
+			ticker := time.NewTicker(150 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					drawDashboard(state)
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// Wait for Ctrl+C
 	<-sigChan
-	done <- true
+	if !state.Headless {
+		done <- true
+	}
 	cleanup()
-	fmt.Print("\r\nExiting Jeti inspector...\r\n")
+	if state.Headless {
+		fmt.Fprint(os.Stderr, "\nExiting Jeti inspector...\n")
+	} else {
+		fmt.Print("\r\nExiting Jeti inspector...\r\n")
+	}
 }
 
 func decode6b(valByte byte) (float64, int, int8) {

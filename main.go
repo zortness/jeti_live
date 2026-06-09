@@ -528,13 +528,21 @@ func (s *DashboardState) ToggleMenu() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ShowMenu = !s.ShowMenu
+	fmt.Print("\033[H\033[2J")
 }
 
 func (s *DashboardState) cycleInterval() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	intervals := []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second, 5 * time.Second}
+	intervals := []time.Duration{
+		100 * time.Millisecond,
+		500 * time.Millisecond,
+		1 * time.Second,
+		10 * time.Second,
+		30 * time.Second,
+		60 * time.Second,
+	}
 	nextIdx := 0
 	for i, v := range intervals {
 		if v == s.LogInterval {
@@ -690,7 +698,7 @@ func drawDashboard(state *DashboardState) {
 		}
 		
 		fmt.Printf("  [s] Toggle CSV Logging:   %s\033[K\r\n", logStateStr)
-		fmt.Printf("  [i] Cycle Log Interval:   \033[1;36m%v\033[0m (500ms, 1s, 2s, 5s)\033[K\r\n", state.LogInterval)
+		fmt.Printf("  [i] Cycle Log Interval:   \033[1;36m%v\033[0m (0.1s, 0.5s, 1s, 10s, 30s, 60s)\033[K\r\n", state.LogInterval)
 		fmt.Printf("  [d] Cycle Startup Delay:  \033[1;36m%v\033[0m (0s, 5s, 10s, 30s)\033[K\r\n", state.LogDelay)
 		fmt.Print("--------------------------------------------------------------\033[K\r\n")
 		fmt.Print("  [m] Return to Telemetry View\033[K\r\n")

@@ -22,5 +22,5 @@ Thumbs.db
 *.swo
 
 *.pdf
-
 scratch/
+*.csv

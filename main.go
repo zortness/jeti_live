@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/binary"
 	"encoding/csv"
 	"flag"
@@ -18,6 +17,7 @@ import (
 	"jeti_live/jeti"
 
 	"go.bug.st/serial"
+	"golang.org/x/term"
 )
 
 type TelemetryField struct {
@@ -37,6 +37,12 @@ type CSVColumn struct {
 	PhysicalPrefix uint32
 	FieldID        byte
 	HeaderName     string
+}
+
+type AlarmState struct {
+	Code       byte
+	Tone       bool
+	LastUpdate time.Time
 }
 
 type DashboardState struct {
@@ -62,6 +68,10 @@ type DashboardState struct {
 	logWriter        *csv.Writer
 	logTicker        *time.Ticker
 	logDone          chan bool
+
+	// Alarms & Interactive Settings Menu
+	Alarms   map[byte]AlarmState
+	ShowMenu bool
 }
 
 func newDashboardState(port string, baud int) *DashboardState {
@@ -69,6 +79,7 @@ func newDashboardState(port string, baud int) *DashboardState {
 		PortName: port,
 		BaudRate: baud,
 		Devices:  make(map[uint32]*DeviceState),
+		Alarms:   make(map[byte]AlarmState),
 		DeviceID: "Searching...",
 	}
 }
@@ -82,7 +93,7 @@ func (s *DashboardState) UpdateConnection(connected bool) {
 func (s *DashboardState) UpdateDeviceID(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.DeviceID = id
+	s.DeviceID = strings.TrimSpace(id)
 }
 
 func (s *DashboardState) UpdateDisplay(lines [2]string) {
@@ -441,15 +452,16 @@ func (s *DashboardState) stopLogging() {
 	writer := csv.NewWriter(finalFile)
 
 	// 3a. Write Header Row
-	header := make([]string, 1, 1+len(s.LogColumns))
+	header := make([]string, 1, 2+len(s.LogColumns))
 	header[0] = "Timestamp"
+	header = append(header, "Active_Alarms")
 	for _, col := range s.LogColumns {
 		header = append(header, col.HeaderName)
 	}
 	writer.Write(header)
 
 	// 3b. Read, Pad, and Write all rows
-	targetLen := 1 + len(s.LogColumns)
+	targetLen := 2 + len(s.LogColumns)
 	for {
 		record, err := reader.Read()
 		if err != nil {
@@ -483,8 +495,20 @@ func (s *DashboardState) writeLogLine() {
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 
-	row := make([]string, 1, 1+len(s.LogColumns))
+	// Get active alarms (updated within last 3 seconds)
+	var activeAlarms []string
+	now := time.Now()
+	for code, alarm := range s.Alarms {
+		if now.Sub(alarm.LastUpdate) <= 3*time.Second {
+			activeAlarms = append(activeAlarms, string(code))
+		}
+	}
+	sort.Strings(activeAlarms)
+	alarmsVal := strings.Join(activeAlarms, ";")
+
+	row := make([]string, 1, 2+len(s.LogColumns))
 	row[0] = timestamp
+	row = append(row, alarmsVal)
 
 	for _, col := range s.LogColumns {
 		val := ""
@@ -500,6 +524,62 @@ func (s *DashboardState) writeLogLine() {
 	s.logWriter.Flush()
 }
 
+func (s *DashboardState) ToggleMenu() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ShowMenu = !s.ShowMenu
+}
+
+func (s *DashboardState) cycleInterval() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	intervals := []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second, 5 * time.Second}
+	nextIdx := 0
+	for i, v := range intervals {
+		if v == s.LogInterval {
+			nextIdx = (i + 1) % len(intervals)
+			break
+		}
+	}
+	s.LogInterval = intervals[nextIdx]
+
+	// If logging is active, restart ticker
+	if s.LogActive && s.logTicker != nil {
+		s.logTicker.Stop()
+		s.logTicker = time.NewTicker(s.LogInterval)
+
+		close(s.logDone)
+		s.logDone = make(chan bool)
+
+		go func(ticker *time.Ticker, done chan bool) {
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					s.writeLogLine()
+				}
+			}
+		}(s.logTicker, s.logDone)
+	}
+}
+
+func (s *DashboardState) cycleDelay() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delays := []time.Duration{0, 5 * time.Second, 10 * time.Second, 30 * time.Second}
+	nextIdx := 0
+	for i, v := range delays {
+		if v == s.LogDelay {
+			nextIdx = (i + 1) % len(delays)
+			break
+		}
+	}
+	s.LogDelay = delays[nextIdx]
+}
+
 func drawDashboard(state *DashboardState) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -507,17 +587,17 @@ func drawDashboard(state *DashboardState) {
 	// Move cursor to top-left (without clearing screen to prevent flicker)
 	fmt.Print("\033[H")
 
-	fmt.Println("\033[1;36m==============================================================\033[K")
-	fmt.Println("                 JETI TELEMETRY LIVE INSPECTOR\033[K")
-	fmt.Println("==============================================================\033[K\033[0m")
+	fmt.Print("\033[1;36m==============================================================\033[K\r\n")
+	fmt.Print("                 JETI TELEMETRY LIVE INSPECTOR\033[K\r\n")
+	fmt.Print("==============================================================\033[K\033[0m\r\n")
 
 	// Print connection status
 	status := "\033[1;31mDISCONNECTED\033[0m"
 	if state.Connected {
 		status = fmt.Sprintf("\033[1;32mCONNECTED\033[0m (%s @ %d baud)", state.PortName, state.BaudRate)
 	}
-	fmt.Printf("Status: %s\033[K\n", status)
-	fmt.Printf("Device: \033[1;35m%s\033[0m\033[K\n", state.DeviceID)
+	fmt.Printf("Status: %s\033[K\r\n", status)
+	fmt.Printf("Device: \033[1;35m%s\033[0m\033[K\r\n", state.DeviceID)
 
 	// Print CSV Logging Status
 	logStatus := "\033[1;30mINACTIVE\033[0m"
@@ -530,73 +610,157 @@ func drawDashboard(state *DashboardState) {
 		}
 		logStatus = fmt.Sprintf("\033[1;33mWAITING\033[0m (starting in %.1fs, discovering sensors...)", timeLeft)
 	}
-	fmt.Printf("Logging: %s\033[K\n", logStatus)
-	fmt.Println("\033[K")
+	fmt.Printf("Logging: %s\033[K\r\n", logStatus)
+	fmt.Print("\033[K\r\n")
 
-	// Print JetiBox Display Screen
-	fmt.Println("\033[1;33m+----------------------------------+\033[K")
-	fmt.Printf("| %-32s |\033[K\n", state.DisplayLines[0])
-	fmt.Printf("| %-32s |\033[K\n", state.DisplayLines[1])
-	fmt.Println("+----------------------------------+\033[K\033[0m")
-	fmt.Println("\033[K")
-
-	// Print Telemetry parameters table
-	fmt.Println("\033[1mDetected Telemetry Fields (Grouped by Device):\033[K\033[0m")
-	fmt.Println("--------------------------------------------------------------\033[K")
-
-	if len(state.Devices) == 0 {
-		fmt.Println("  (Waiting for telemetry data...)\033[K")
-	} else {
-		// Sort physical prefixes for consistent display
-		var prefixes []uint32
-		for prefix := range state.Devices {
-			prefixes = append(prefixes, prefix)
-		}
-		sort.Slice(prefixes, func(i, j int) bool {
-			return prefixes[i] < prefixes[j]
-		})
-
-		for _, prefix := range prefixes {
-			dev := state.Devices[prefix]
-			devName := dev.DeviceName
-			if devName == "" {
-				// Default mappings if we don't have the text registration name yet
-				switch prefix {
-				case 0x4BA6E2, 0x6FA6E2:
-					devName = "Receiver"
-				case 0x0DA881:
-					devName = "MT-125"
-				default:
-					devName = fmt.Sprintf("Device %06X", prefix)
-				}
-			}
-			fmt.Printf("\033[1;35m>>> %s (Serial Prefix: 0x%06X)\033[0m\033[K\n", devName, prefix)
-			fmt.Printf("    %-10s | %-15s | %-20s | %-12s\033[K\n", "Field ID", "Field Name", "Value", "Last Update")
-			fmt.Println("    ----------------------------------------------------------\033[K")
-
-			// Sort field IDs
-			var fieldIDs []byte
-			for fid := range dev.Fields {
-				fieldIDs = append(fieldIDs, fid)
-			}
-			sort.Slice(fieldIDs, func(i, j int) bool {
-				return fieldIDs[i] < fieldIDs[j]
-			})
-
-			for _, fid := range fieldIDs {
-				f := dev.Fields[fid]
-				timeStr := f.LastUpdate.Format("15:04:05.000")
-				unitSuffix := ""
-				if f.Unit != "" {
-					unitSuffix = " " + f.Unit
-				}
-				valPrint := f.Value + unitSuffix
-				fmt.Printf("    0x%02X       | %-15s | \033[1;32m%-20s\033[0m | %-12s\033[K\n", fid, f.FieldName, valPrint, timeStr)
-			}
-			fmt.Println("--------------------------------------------------------------\033[K")
+	// Prune expired alarms (> 3s)
+	now := time.Now()
+	for code, alarm := range state.Alarms {
+		if now.Sub(alarm.LastUpdate) > 3*time.Second {
+			delete(state.Alarms, code)
 		}
 	}
-	fmt.Println("\nPress Ctrl+C to exit. Type 'stop' (t) / 'start' (s) to control CSV logging.\033[K")
+
+	// Prepare Alarm Display Strings
+	var activeAlarms []string
+	for code := range state.Alarms {
+		var desc string
+		switch code {
+		case 'S':
+			desc = "Signal Lost"
+		case 'B':
+			desc = "Receiver Battery Low"
+		case 'U':
+			desc = "Under Voltage"
+		case 'I':
+			desc = "Current High"
+		case 'A':
+			desc = "Capacity Alert"
+		case 'T':
+			desc = "Temperature High"
+		case 'M':
+			desc = "Speed Limit Exceeded"
+		case 'P':
+			desc = "Pressure Limit Exceeded"
+		case 'R':
+			desc = "RPM Limit Exceeded"
+		case 'H':
+			desc = "High Voltage/Altitude"
+		case 'L':
+			desc = "Low Battery/Altitude"
+		default:
+			desc = fmt.Sprintf("Alarm %c", code)
+		}
+		activeAlarms = append(activeAlarms, fmt.Sprintf("%s (%c)", desc, code))
+	}
+	sort.Strings(activeAlarms)
+
+	boxColor := "\033[1;33m" // Yellow
+	line1 := "ALARMS: None"
+	line2 := "System status clear"
+	if len(activeAlarms) > 0 {
+		boxColor = "\033[1;31m" // Red
+		line1 = "ALARMS: ACTIVE"
+		line2 = strings.Join(activeAlarms, ", ")
+		if len(line2) > 32 {
+			line2 = line2[:29] + "..."
+		}
+	}
+
+	// Print JetiBox Display Screen (Repurposed for Alarms)
+	fmt.Printf("%s+----------------------------------+\033[K\r\n", boxColor)
+	fmt.Printf("| %-32s |\033[K\r\n", line1)
+	fmt.Printf("| %-32s |\033[K\r\n", line2)
+	fmt.Printf("+----------------------------------+\033[K\033[0m\r\n")
+	fmt.Print("\033[K\r\n")
+
+	if state.ShowMenu {
+		fmt.Print("\033[1;35mSETTINGS MENU OVERLAY\033[K\033[0m\r\n")
+		fmt.Print("--------------------------------------------------------------\033[K\r\n")
+		
+		logStateStr := "\033[1;30mINACTIVE\033[0m"
+		if state.LogActive {
+			logStateStr = fmt.Sprintf("\033[1;32mACTIVE\033[0m (file: %s)", state.LogFileName)
+		} else if state.LogDelayActive {
+			timeLeft := time.Until(state.LogDelayEndTime).Seconds()
+			if timeLeft < 0 {
+				timeLeft = 0
+			}
+			logStateStr = fmt.Sprintf("\033[1;33mWAITING\033[0m (starting in %.1fs)", timeLeft)
+		}
+		
+		fmt.Printf("  [s] Toggle CSV Logging:   %s\033[K\r\n", logStateStr)
+		fmt.Printf("  [i] Cycle Log Interval:   \033[1;36m%v\033[0m (500ms, 1s, 2s, 5s)\033[K\r\n", state.LogInterval)
+		fmt.Printf("  [d] Cycle Startup Delay:  \033[1;36m%v\033[0m (0s, 5s, 10s, 30s)\033[K\r\n", state.LogDelay)
+		fmt.Print("--------------------------------------------------------------\033[K\r\n")
+		fmt.Print("  [m] Return to Telemetry View\033[K\r\n")
+		fmt.Print("--------------------------------------------------------------\033[K\r\n")
+		
+		// Fill standard height to avoid jumping lines (let's clear the rest of the lines)
+		for i := 0; i < 12; i++ {
+			fmt.Print("\033[K\r\n")
+		}
+		
+		fmt.Print("\r\nPress Ctrl+C to exit. Press [m] to close settings menu.\033[K\r\n")
+	} else {
+		// Print Telemetry parameters table
+		fmt.Print("\033[1mDetected Telemetry Fields (Grouped by Device):\033[K\033[0m\r\n")
+		fmt.Print("--------------------------------------------------------------\033[K\r\n")
+
+		if len(state.Devices) == 0 {
+			fmt.Print("  (Waiting for telemetry data...)\033[K\r\n")
+		} else {
+			// Sort physical prefixes for consistent display
+			var prefixes []uint32
+			for prefix := range state.Devices {
+				prefixes = append(prefixes, prefix)
+			}
+			sort.Slice(prefixes, func(i, j int) bool {
+				return prefixes[i] < prefixes[j]
+			})
+
+			for _, prefix := range prefixes {
+				dev := state.Devices[prefix]
+				devName := dev.DeviceName
+				if devName == "" {
+					// Default mappings if we don't have the text registration name yet
+					switch prefix {
+					case 0x4BA6E2, 0x6FA6E2:
+						devName = "Receiver"
+					case 0x0DA881:
+						devName = "MT-125"
+					default:
+						devName = fmt.Sprintf("Device %06X", prefix)
+					}
+				}
+				fmt.Printf("\033[1;35m>>> %s (Serial Prefix: 0x%06X)\033[0m\033[K\r\n", devName, prefix)
+				fmt.Printf("    %-10s | %-15s | %-20s | %-12s\033[K\r\n", "Field ID", "Field Name", "Value", "Last Update")
+				fmt.Print("    ----------------------------------------------------------\033[K\r\n")
+
+				// Sort field IDs
+				var fieldIDs []byte
+				for fid := range dev.Fields {
+					fieldIDs = append(fieldIDs, fid)
+				}
+				sort.Slice(fieldIDs, func(i, j int) bool {
+					return fieldIDs[i] < fieldIDs[j]
+				})
+
+				for _, fid := range fieldIDs {
+					f := dev.Fields[fid]
+					timeStr := f.LastUpdate.Format("15:04:05.000")
+					unitSuffix := ""
+					if f.Unit != "" {
+						unitSuffix = " " + f.Unit
+					}
+					valPrint := f.Value + unitSuffix
+					fmt.Printf("    0x%02X       | %-15s | \033[1;32m%-20s\033[0m | %-12s\033[K\r\n", fid, f.FieldName, valPrint, timeStr)
+				}
+				fmt.Print("--------------------------------------------------------------\033[K\r\n")
+			}
+		}
+		fmt.Print("\r\nPress Ctrl+C to exit. Press [m] for settings menu | [s] to toggle logging.\033[K\r\n")
+	}
 }
 
 func main() {
@@ -647,23 +811,6 @@ func main() {
 		}()
 	}
 
-	// Stdin Command reader goroutine
-	go func() {
-		reader := bufio.NewReader(os.Stdin)
-		for {
-			text, err := reader.ReadString('\n')
-			if err != nil {
-				return
-			}
-			text = strings.TrimSpace(strings.ToLower(text))
-			if text == "start" || text == "s" {
-				state.startLogging()
-			} else if text == "stop" || text == "t" {
-				state.stopLogging()
-			}
-		}
-	}()
-
 	fmt.Printf("Opening port %s...\n", *portFlag)
 	port, err := serial.Open(*portFlag, mode)
 	if err != nil {
@@ -683,6 +830,63 @@ func main() {
 
 	// Clean input buffer
 	port.ResetInputBuffer()
+
+	// Put terminal in raw mode
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		fmt.Printf("Warning: Failed to make terminal raw: %v\r\n", err)
+	}
+
+	var restoreOnce sync.Once
+	cleanup := func() {
+		restoreOnce.Do(func() {
+			if oldState != nil {
+				term.Restore(int(os.Stdin.Fd()), oldState)
+			}
+			state.stopLogging()
+		})
+	}
+	defer cleanup()
+
+	// Stdin Command reader goroutine
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil || n == 0 {
+				break
+			}
+			char := buf[0]
+			if char == 0x03 { // Ctrl+C
+				cleanup()
+				fmt.Print("\r\nExiting Jeti inspector...\r\n")
+				os.Exit(0)
+			}
+			
+			lower := strings.ToLower(string(char))
+			if len(lower) > 0 {
+				key := lower[0]
+				switch key {
+				case 'm':
+					state.ToggleMenu()
+				case 's':
+					state.mu.Lock()
+					isDelayActive := state.LogDelayActive
+					isActive := state.LogActive
+					state.mu.Unlock()
+					if isActive || isDelayActive {
+						state.stopLogging()
+					} else {
+						state.startLogging()
+					}
+				case 'i':
+					state.cycleInterval()
+				case 'd':
+					state.cycleDelay()
+				}
+			}
+		}
+	}()
 
 	// Channel to signal shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -741,7 +945,11 @@ func main() {
 					// Handle packet data
 					switch pkt.CmdType {
 					case 0x02:
-						state.UpdateDeviceID(strings.TrimSpace(string(pkt.Payload)))
+						payload := pkt.Payload
+						if len(payload) > 16 {
+							payload = payload[:16]
+						}
+						state.UpdateDeviceID(string(payload))
 					case 0x30:
 						parseTelemetry(state, pkt.Payload)
 
@@ -829,8 +1037,8 @@ func main() {
 	// Wait for Ctrl+C
 	<-sigChan
 	done <- true
-	state.stopLogging()
-	fmt.Println("\nExiting Jeti inspector...")
+	cleanup()
+	fmt.Print("\r\nExiting Jeti inspector...\r\n")
 }
 
 func decode6b(valByte byte) (float64, int, int8) {
@@ -942,6 +1150,21 @@ func parseTelemetry(state *DashboardState, payload []byte) {
 	}
 	lenEx := int(payload[1])
 	if len(payload) < 3+lenEx {
+		return
+	}
+
+	// Check if this is a Morse Alarm packet
+	// Jeti Alarm packet: payload[3] == 0x7E, payload[4]&0x0F == 0x02, payload[5] is 0x22 or 0x23
+	if payload[3] == 0x7E && len(payload) >= 7 && (payload[4]&0x0F == 0x02) && (payload[5] == 0x22 || payload[5] == 0x23) {
+		code := payload[6]
+		tone := payload[5] == 0x23
+		state.mu.Lock()
+		state.Alarms[code] = AlarmState{
+			Code:       code,
+			Tone:       tone,
+			LastUpdate: time.Now(),
+		}
+		state.mu.Unlock()
 		return
 	}
 
